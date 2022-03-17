@@ -14,21 +14,17 @@ import shutil
 import argparse
 from torchvision import datasets, transforms
 from torch.autograd import Variable # Useful info about autograd: http://pytorch.org/docs/master/notes/autograd.html
+import wandb
 
 import dataset
-from utils import *    
+from utils import *
 from cfg import parse_cfg
-from region_loss import RegionLoss
 from darknet import Darknet
 from MeshPly import MeshPly
 
-import warnings
-warnings.filterwarnings("ignore")
+# import warnings
+# warnings.filterwarnings("ignore")
 
-# Create new directory
-def makedirs(path):
-    if not os.path.exists( path ):
-        os.makedirs( path )
 
 # Adjust learning rate during training, learning schedule can be changed in network config file
 def adjust_learning_rate(optimizer, batch):
@@ -45,28 +41,31 @@ def adjust_learning_rate(optimizer, batch):
         param_group['lr'] = lr/batch_size
     return lr
 
+
 def train(epoch):
 
     global processed_batches
-    
+
     # Initialize timer
     t0 = time.time()
 
     # Get the dataloader for training dataset
-    train_loader = torch.utils.data.DataLoader(dataset.listDataset(trainlist, 
-                                                                   shape=(init_width, init_height),
-                                                            	   shuffle=True,
-                                                            	   transform=transforms.Compose([transforms.ToTensor(),]), 
-                                                            	   train=True, 
-                                                            	   seen=model.seen,
-                                                            	   batch_size=batch_size,
-                                                            	   num_workers=num_workers, 
-                                                                   bg_file_names=bg_file_names),
-                                                batch_size=batch_size, shuffle=False, **kwargs)
+    train_loader = torch.utils.data.DataLoader(
+        dataset.listDataset(trainlist,
+                            shape=(init_width, init_height),
+                            shuffle=True,
+                            transform=transforms.Compose([transforms.ToTensor(), ]),
+                            train=True,
+                            seen=model.seen,
+                            batch_size=batch_size,
+                            num_workers=num_workers,
+                            bg_file_names=bg_file_names),
+        batch_size=batch_size, shuffle=False, **kwargs)
 
     # TRAINING
     lr = adjust_learning_rate(optimizer, processed_batches)
-    logging('epoch %d, processed %d samples, lr %f' % (epoch, epoch * len(train_loader.dataset), lr))
+    n_steps_per_epoch = math.ceil(len(train_loader.dataset) / float(batch_size))
+    logging('epoch %d, steps %d, processed %d samples, lr %f' % (epoch, n_steps_per_epoch, epoch * len(train_loader.dataset), lr))
     # Start training
     model.train()
     t1 = time.time()
@@ -76,7 +75,7 @@ def train(epoch):
     for batch_idx, (data, target) in enumerate(train_loader):
         t2 = time.time()
         # adjust learning rate
-        adjust_learning_rate(optimizer, processed_batches)
+        lr = adjust_learning_rate(optimizer, processed_batches)
         processed_batches = processed_batches + 1
         # Pass the data to GPU
         if use_cuda:
@@ -95,7 +94,7 @@ def train(epoch):
         region_loss.seen = region_loss.seen + data.data.size(0)
         # Compute loss, grow an array of losses for saving later on
         loss = region_loss(output, target, epoch)
-        training_iters.append(epoch * math.ceil(len(train_loader.dataset) / float(batch_size) ) + niter)
+        training_iters.append(epoch * n_steps_per_epoch + niter)
         training_losses.append(convert2cpu(loss.data))
         niter += 1
         t7 = time.time()
@@ -127,8 +126,14 @@ def train(epoch):
             print('            step : %f' % (avg_time[7]/(batch_idx)))
             print('           total : %f' % (avg_time[8]/(batch_idx)))
         t1 = time.time()
-    t1 = time.time()
-    return epoch * math.ceil(len(train_loader.dataset) / float(batch_size) ) + niter - 1 
+
+    training_metrics.update({
+        'train/train_loss': np.mean(training_losses[-n_steps_per_epoch:]),
+        'train/learnring_rate': lr,
+    })
+
+    return epoch * n_steps_per_epoch + niter - 1
+
 
 def test(epoch, niter):
     def truths_length(truths):
@@ -136,7 +141,7 @@ def test(epoch, niter):
             if truths[i][1] == 0:
                 return i
 
-    # Set the module in evaluation mode (turn off dropout, batch normalization etc.)        
+    # Set the module in evaluation mode (turn off dropout, batch normalization etc.)
     model.eval()
 
     # Parameters
@@ -155,78 +160,94 @@ def test(epoch, niter):
     errs_corner2D        = []
     logging("   Testing...")
     logging("   Number of test samples: %d" % len(test_loader.dataset))
-    notpredicted = 0
-    # Iterate through test examples 
+
+    loss_per_epoch = 0.
+    num_batches = math.ceil(len(test_loader.dataset) / batch_size)
+
+    # Iterate through test examples
     for batch_idx, (data, target) in enumerate(test_loader):
         t1 = time.time()
         # Pass the data to GPU
         if use_cuda:
             data = data.cuda()
             target = target.cuda()
-        # Wrap tensors in Variable class, set volatile=True for inference mode and to use minimal memory during inference
-        data = Variable(data, volatile=True)
         t2 = time.time()
-        # Formward pass
-        output = model(data).data  
+        # Forward pass
+        with torch.no_grad():
+            output = model(data)
+            loss_per_epoch += region_loss(output, target, epoch).item()
         t3 = time.time()
         # Using confidence threshold, eliminate low-confidence predictions
-        all_boxes = get_region_boxes(output, num_classes, num_keypoints)        
+        all_boxes = get_region_boxes(output, num_classes, num_keypoints)
         t4 = time.time()
         # Iterate through all batch elements
         for box_pr, target in zip([all_boxes], [target[0]]):
             # For each image, get all the targets (for multiple object pose estimation, there might be more than 1 target per image)
             truths = target.view(-1, num_keypoints*2+3)
             # Get how many objects are present in the scene
-            num_gts    = truths_length(truths)
+            num_gts = truths_length(truths)
             # Iterate through each ground-truth object
             for k in range(num_gts):
+                # reorganize such that box_gt has the same layout as box_pr.
+                # 9 * 2 + 1 (detection confidence) + 1 (max class confidence) + 1 (max class id)
                 box_gt = list()
                 for j in range(1, 2*num_keypoints+1):
-                    box_gt.append(truths[k][j])
+                    box_gt.append(truths[k][j].item())
                 box_gt.extend([1.0, 1.0])
-                box_gt.append(truths[k][0])
-                   
-                # Denormalize the corner predictions 
+                box_gt.append(truths[k][0].item())
+
+                # Denormalize the corner predictions
                 corners2D_gt = np.array(np.reshape(box_gt[:num_keypoints*2], [num_keypoints, 2]), dtype='float32')
                 corners2D_pr = np.array(np.reshape(box_pr[:num_keypoints*2], [num_keypoints, 2]), dtype='float32')
                 corners2D_gt[:, 0] = corners2D_gt[:, 0] * im_width
-                corners2D_gt[:, 1] = corners2D_gt[:, 1] * im_height               
+                corners2D_gt[:, 1] = corners2D_gt[:, 1] * im_height
                 corners2D_pr[:, 0] = corners2D_pr[:, 0] * im_width
                 corners2D_pr[:, 1] = corners2D_pr[:, 1] * im_height
 
+                # Resized
+                # corners2D_gt[:, 0] = np.clip(corners2D_gt[:, 0] * 3 - 1, 0, 1) * 1944
+                # corners2D_gt[:, 1] = np.clip(corners2D_gt[:, 1] * 3 - 1, 0, 1) * 1200
+                # corners2D_pr[:, 0] = np.clip(corners2D_pr[:, 0] * 3 - 1, 0, 1) * 1944
+                # corners2D_pr[:, 1] = np.clip(corners2D_pr[:, 1] * 3 - 1, 0, 1) * 1200
+
                 # Compute corner prediction error
+                #   (average euclidean distance btw pred. and gt. for 9 keypoints.)
                 corner_norm = np.linalg.norm(corners2D_gt - corners2D_pr, axis=1)
                 corner_dist = np.mean(corner_norm)
                 errs_corner2D.append(corner_dist)
 
                 # Compute [R|t] by pnp
-                R_gt, t_gt = pnp(np.array(np.transpose(np.concatenate((np.zeros((3, 1)), corners3D[:3, :]), axis=1)), dtype='float32'),  corners2D_gt, np.array(internal_calibration, dtype='float32'))
-                R_pr, t_pr = pnp(np.array(np.transpose(np.concatenate((np.zeros((3, 1)), corners3D[:3, :]), axis=1)), dtype='float32'),  corners2D_pr, np.array(internal_calibration, dtype='float32'))
+                R_gt, t_gt = pnp(np.array(np.transpose(np.concatenate((np.zeros((3, 1)), corners3D[:3, :]), axis=1)), dtype='float32'), corners2D_gt, np.array(internal_calibration, dtype='float32'))
+                R_pr, t_pr = pnp(np.array(np.transpose(np.concatenate((np.zeros((3, 1)), corners3D[:3, :]), axis=1)), dtype='float32'), corners2D_pr, np.array(internal_calibration, dtype='float32'))
 
                 # Compute errors
                 # Compute translation error
+                #   (Translation distance btw pred. and gt. pose (from pnp))
                 trans_dist   = np.sqrt(np.sum(np.square(t_gt - t_pr)))
                 errs_trans.append(trans_dist)
 
                 # Compute angle error
+                #   (Rotation distance btw pred. pose and gt. pose (from pnp))
                 angle_dist   = calcAngularDistance(R_gt, R_pr)
                 errs_angle.append(angle_dist)
 
                 # Compute pixel error
+                #   (All vertices from mesh, 3D projected to 2D, average euclidean distance.)
                 Rt_gt        = np.concatenate((R_gt, t_gt), axis=1)
                 Rt_pr        = np.concatenate((R_pr, t_pr), axis=1)
-                proj_2d_gt   = compute_projection(vertices, Rt_gt, internal_calibration) 
-                proj_2d_pred = compute_projection(vertices, Rt_pr, internal_calibration) 
+                proj_2d_gt   = compute_projection(vertices, Rt_gt, internal_calibration)
+                proj_2d_pred = compute_projection(vertices, Rt_pr, internal_calibration)
                 norm         = np.linalg.norm(proj_2d_gt - proj_2d_pred, axis=0)
                 pixel_dist   = np.mean(norm)
                 errs_2d.append(pixel_dist)
 
                 # Compute 3D distances
-                transform_3d_gt   = compute_transformation(vertices, Rt_gt) 
-                transform_3d_pred = compute_transformation(vertices, Rt_pr)  
+                # (All vertices from mesh, 3D average euclidean distance.)
+                transform_3d_gt   = compute_transformation(vertices, Rt_gt)
+                transform_3d_pred = compute_transformation(vertices, Rt_pr)
                 norm3d            = np.linalg.norm(transform_3d_gt - transform_3d_pred, axis=0)
-                vertex_dist       = np.mean(norm3d)    
-                errs_3d.append(vertex_dist)  
+                vertex_dist       = np.mean(norm3d)
+                errs_3d.append(vertex_dist)
 
                 # Sum errors
                 testing_error_trans  += trans_dist
@@ -237,16 +258,16 @@ def test(epoch, niter):
         t5 = time.time()
 
     # Compute 2D projection, 6D pose and 5cm5degree scores
-    px_threshold = 5 # 5 pixel threshold for 2D reprojection error is standard in recent sota 6D object pose estimation works 
+    px_threshold = 5  # 5 pixel threshold for 2D reprojection error is standard in recent sota 6D object pose estimation works
     eps          = 1e-5
     acc          = len(np.where(np.array(errs_2d) <= px_threshold)[0]) * 100. / (len(errs_2d)+eps)
     acc3d        = len(np.where(np.array(errs_3d) <= vx_threshold)[0]) * 100. / (len(errs_3d)+eps)
-    acc5cm5deg   = len(np.where((np.array(errs_trans) <= 0.05) & (np.array(errs_angle) <= 5))[0]) * 100. / (len(errs_trans)+eps)
-    corner_acc   = len(np.where(np.array(errs_corner2D) <= px_threshold)[0]) * 100. / (len(errs_corner2D)+eps)
+    acc5cm5deg   = len(np.where((np.array(errs_trans) <= 50) & (np.array(errs_angle) <= 5))[0]) * 100. / (len(errs_trans)+eps)
+    acc_corner   = len(np.where(np.array(errs_corner2D) <= px_threshold)[0]) * 100. / (len(errs_corner2D)+eps)
     mean_err_2d  = np.mean(errs_2d)
     mean_corner_err_2d = np.mean(errs_corner2D)
     nts = float(testing_samples)
-    
+
     if testtime:
         print('-----------------------------------')
         print('  tensor to cuda : %f' % (t2 - t1))
@@ -257,11 +278,11 @@ def test(epoch, niter):
         print('-----------------------------------')
 
     # Print test statistics
-    logging("   Mean corner error is %f" % (mean_corner_err_2d))
+    logging("   Mean corner error is %f pixels" % (mean_corner_err_2d))
     logging('   Acc using {} px 2D Projection = {:.2f}%'.format(px_threshold, acc))
-    logging('   Acc using {} vx 3D Transformation = {:.2f}%'.format(vx_threshold, acc3d))
+    logging('   Acc using {} mm 3D Transformation = {:.2f}%'.format(vx_threshold, acc3d))
     logging('   Acc using 5 cm 5 degree metric = {:.2f}%'.format(acc5cm5deg))
-    logging('   Translation error: %f, angle error: %f' % (testing_error_trans/(nts+eps), testing_error_angle/(nts+eps)) )
+    logging('   Translation error: {:.2f} mm, angle error: {:.2f} deg'.format(testing_error_trans/(nts+eps), testing_error_angle/(nts+eps)))
 
     # Register losses and errors for saving later on
     testing_iters.append(niter)
@@ -270,14 +291,27 @@ def test(epoch, niter):
     testing_errors_pixel.append(testing_error_pixel/(nts+eps))
     testing_accuracies.append(acc)
 
+    testing_metrics.update({
+        'val/val_loss': loss_per_epoch / num_batches,
+        'val/val_err_corner': mean_corner_err_2d,
+        'val/val_err_trans': testing_errors_trans[-1],
+        'val/val_err_angle': testing_errors_angle[-1],
+        'val/val_err_vtx2d': testing_errors_pixel[-1],
+        'val/val_acc_vtx2d': acc,
+        'val/val_acc_vtx3d': acc3d,
+        'val/val_acc_corner': acc_corner,
+        'val/val_acc_5cm5deg': acc5cm5deg,
+    })
+
+
 if __name__ == "__main__":
 
     # Parse configuration files
     parser = argparse.ArgumentParser(description='SingleShotPose')
-    parser.add_argument('--datacfg', type=str, default='cfg/ape.data') # data config
-    parser.add_argument('--modelcfg', type=str, default='cfg/yolo-pose.cfg') # network config
-    parser.add_argument('--initweightfile', type=str, default='cfg/darknet19_448.conv.23') # imagenet initialized weights
-    parser.add_argument('--pretrain_num_epochs', type=int, default=15) # how many epoch to pretrain
+    parser.add_argument('--datacfg', type=str, default='cfg/ape.data')  # data config
+    parser.add_argument('--modelcfg', type=str, default='cfg/yolo-pose.cfg')  # network config
+    parser.add_argument('--initweightfile', type=str, default='cfg/darknet19_448.conv.23')  # imagenet initialized weights
+    parser.add_argument('--pretrain_num_epochs', type=int, default=15)  # how many epoch to pretrain
     args                = parser.parse_args()
     datacfg             = args.datacfg
     modelcfg            = args.modelcfg
@@ -289,11 +323,11 @@ if __name__ == "__main__":
     net_options   = parse_cfg(modelcfg)[0]
     trainlist     = data_options['train']
     testlist      = data_options['valid']
-    gpus          = data_options['gpus'] 
+    gpus          = data_options['gpus']
     meshname      = data_options['mesh']
     num_workers   = int(data_options['num_workers'])
     backupdir     = data_options['backup']
-    vx_threshold  = float(data_options['diam']) * 0.1 # threshold for the ADD metric
+    vx_threshold  = float(data_options['diam']) * 0.1  # threshold for the ADD metric
     if not os.path.exists(backupdir):
         makedirs(backupdir)
     batch_size    = int(net_options['batch'])
@@ -311,7 +345,7 @@ if __name__ == "__main__":
     # Train parameters
     max_epochs    = int(net_options['max_epochs'])
     num_keypoints = int(net_options['num_keypoints'])
-    
+
     # Test parameters
     im_width    = int(data_options['width'])
     im_height   = int(data_options['height'])
@@ -330,20 +364,22 @@ if __name__ == "__main__":
         os.environ['CUDA_VISIBLE_DEVICES'] = gpus
         torch.cuda.manual_seed(seed)
 
+    wandb.init(project='ssp', entity='wsi', tags=['homemade'])
+
     # Specifiy the model and the loss
     model       = Darknet(modelcfg)
-    region_loss = RegionLoss(num_keypoints=9, num_classes=1, anchors=[], num_anchors=1, pretrain_num_epochs=15)
+    region_loss = model.loss
+    region_loss.pretrain_num_epochs = pretrain_num_epochs
 
     # Model settings
-    model.load_weights_until_last(initweightfile) 
+    model.load_weights_until_last(initweightfile)
     model.print_network()
     model.seen = 0
-    region_loss.iter  = model.iter
     region_loss.seen  = model.seen
     processed_batches = model.seen//batch_size
     init_width        = model.width
     init_height       = model.height
-    init_epoch        = model.seen//nsamples 
+    init_epoch        = model.seen//nsamples
 
     # Variable to save
     training_iters          = []
@@ -355,27 +391,31 @@ if __name__ == "__main__":
     testing_errors_pixel    = []
     testing_accuracies      = []
 
+    # Metrics to log
+    training_metrics = {}
+    testing_metrics = {}
+
     # Get the intrinsic camerea matrix, mesh, vertices and corners of the model
     mesh                 = MeshPly(meshname)
     vertices             = np.c_[np.array(mesh.vertices), np.ones((len(mesh.vertices), 1))].transpose()
     corners3D            = get_3D_corners(vertices)
     internal_calibration = get_camera_intrinsic(u0, v0, fx, fy)
 
-
     # Specify the number of workers
     kwargs = {'num_workers': num_workers, 'pin_memory': True} if use_cuda else {}
 
     # Get the dataloader for test data
-    test_loader = torch.utils.data.DataLoader(dataset.listDataset(testlist, 
-    															  shape=(test_width, test_height),
-                                                                  shuffle=False,
-                                                                  transform=transforms.Compose([transforms.ToTensor(),]), 
-                                                                  train=False),
-                                             batch_size=1, shuffle=False, **kwargs)
+    test_loader = torch.utils.data.DataLoader(
+        dataset.listDataset(testlist,
+                            shape=(test_width, test_height),
+                            shuffle=False,
+                            transform=transforms.Compose([transforms.ToTensor(),]),
+                            train=False),
+        batch_size=1, shuffle=False, **kwargs)
 
     # Pass the model to GPU
     if use_cuda:
-        model = model.cuda() # model = torch.nn.DataParallel(model, device_ids=[0]).cuda() # Multiple GPU parallelism
+        model = model.cuda()  # model = torch.nn.DataParallel(model, device_ids=[0]).cuda() # Multiple GPU parallelism
 
     # Get the optimizer
     params_dict = dict(model.named_parameters())
@@ -387,12 +427,12 @@ if __name__ == "__main__":
             params += [{'params': [value], 'weight_decay': decay*batch_size}]
     optimizer = optim.SGD(model.parameters(), lr=learning_rate/batch_size, momentum=momentum, dampening=0, weight_decay=decay*batch_size)
 
-    best_acc      = -sys.maxsize 
-    for epoch in range(init_epoch, max_epochs): 
+    best_acc      = -sys.maxsize
+    for epoch in range(init_epoch, max_epochs):
         # TRAIN
         niter = train(epoch)
         # TEST and SAVE
-        if (epoch % 10 == 0) and (epoch > 15): 
+        if (epoch % 10 == 9):  #and (epoch > 15):
             test(epoch, niter)
             logging('save training stats to %s/costs.npz' % (backupdir))
             np.savez(os.path.join(backupdir, "costs.npz"),
@@ -401,10 +441,15 @@ if __name__ == "__main__":
                 testing_iters=testing_iters,
                 testing_accuracies=testing_accuracies,
                 testing_errors_pixel=testing_errors_pixel,
-                testing_errors_angle=testing_errors_angle) 
-            if (testing_accuracies[-1] > best_acc ):
+                testing_errors_angle=testing_errors_angle)
+            if (testing_accuracies[-1] > best_acc):
                 best_acc = testing_accuracies[-1]
                 logging('best model so far!')
                 logging('save weights to %s/model.weights' % (backupdir))
                 model.save_weights('%s/model.weights' % (backupdir))
+            wandb.log({**training_metrics, **testing_metrics})
+        else:
+            wandb.log(training_metrics)
+
     # shutil.copy2('%s/model.weights' % (backupdir), '%s/model_backup.weights' % (backupdir))
+    wandb.finish()

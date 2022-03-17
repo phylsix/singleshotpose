@@ -1,0 +1,13 @@
+train  = LINEMOD/tee/train.txt
+valid  = LINEMOD/tee/val.txt
+backup = backup/tee
+mesh = LINEMOD/tee/tee.ply
+name = tee
+diam = 150.7
+gpus = 1
+width = 1944
+height = 1200
+fx = 1780.78649902344
+fy = 1782.1552734375
+u0 = 938.193786621094
+v0 = 575.768920898438

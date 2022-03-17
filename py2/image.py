@@ -16,7 +16,7 @@ def distort_image(im, hue, sat, val):
     cs = list(im.split())
     cs[1] = cs[1].point(lambda i: i * sat)
     cs[2] = cs[2].point(lambda i: i * val)
-    
+
     def change_hue(x):
         x += hue*255
         if x > 255:
@@ -32,7 +32,7 @@ def distort_image(im, hue, sat, val):
 
 def rand_scale(s):
     scale = random.uniform(1, s)
-    if(random.randint(1,10000)%2): 
+    if(random.randint(1,10000)%2):
         return scale
     return 1./scale
 
@@ -46,7 +46,7 @@ def random_distort_image(im, hue, saturation, exposure):
 def data_augmentation(img, shape, jitter, hue, saturation, exposure):
 
     ow, oh = img.size
-    
+
     dw =int(ow*jitter)
     dh =int(oh*jitter)
 
@@ -60,7 +60,7 @@ def data_augmentation(img, shape, jitter, hue, saturation, exposure):
 
     sx = float(swidth)  / ow
     sy = float(sheight) / oh
-    
+
     flip = random.randint(1,10000)%2
     cropped = img.crop( (pleft, ptop, pleft + swidth - 1, ptop + sheight - 1))
 
@@ -70,8 +70,8 @@ def data_augmentation(img, shape, jitter, hue, saturation, exposure):
     sized = cropped.resize(shape)
 
     img = random_distort_image(sized, hue, saturation, exposure)
-    
-    return img, flip, dx,dy,sx,sy 
+
+    return img, flip, dx,dy,sx,sy
 
 def fill_truth_detection(labpath, w, h, flip, dx, dy, sx, sy):
     max_boxes = 50
@@ -102,10 +102,10 @@ def fill_truth_detection(labpath, w, h, flip, dx, dy, sx, sy):
             x8 = bs[i][17]
             y8 = bs[i][18]
 
-            x0 = min(0.999, max(0, x0 * sx - dx)) 
-            y0 = min(0.999, max(0, y0 * sy - dy)) 
-            x1 = min(0.999, max(0, x1 * sx - dx)) 
-            y1 = min(0.999, max(0, y1 * sy - dy)) 
+            x0 = min(0.999, max(0, x0 * sx - dx))
+            y0 = min(0.999, max(0, y0 * sy - dy))
+            x1 = min(0.999, max(0, x1 * sx - dx))
+            y1 = min(0.999, max(0, y1 * sy - dy))
             x2 = min(0.999, max(0, x2 * sx - dx))
             y2 = min(0.999, max(0, y2 * sy - dy))
             x3 = min(0.999, max(0, x3 * sx - dx))
@@ -120,7 +120,7 @@ def fill_truth_detection(labpath, w, h, flip, dx, dy, sx, sy):
             y7 = min(0.999, max(0, y7 * sy - dy))
             x8 = min(0.999, max(0, x8 * sx - dx))
             y8 = min(0.999, max(0, y8 * sy - dy))
-            
+
             bs[i][1] = x0
             bs[i][2] = y0
             bs[i][3] = x1
@@ -139,7 +139,7 @@ def fill_truth_detection(labpath, w, h, flip, dx, dy, sx, sy):
             bs[i][16] = y7
             bs[i][17] = x8
             bs[i][18] = y8
-            
+
             label[cc] = bs[i]
             cc += 1
             if cc >= 50:
@@ -149,16 +149,16 @@ def fill_truth_detection(labpath, w, h, flip, dx, dy, sx, sy):
     return label
 
 def change_background(img, mask, bg):
-    # oh = img.height  
+    # oh = img.height
     # ow = img.width
     ow, oh = img.size
     bg = bg.resize((ow, oh)).convert('RGB')
-    
+
     imcs = list(img.split())
     bgcs = list(bg.split())
     maskcs = list(mask.split())
     fics = list(Image.new(img.mode, img.size).split())
-    
+
     for c in range(len(imcs)):
         negmask = maskcs[c].point(lambda i: 1 - i / 255)
         posmask = maskcs[c].point(lambda i: i / 255)
@@ -169,13 +169,13 @@ def change_background(img, mask, bg):
 
 def load_data_detection(imgpath, shape, jitter, hue, saturation, exposure, bgpath):
     labpath = imgpath.replace('images', 'labels').replace('JPEGImages', 'labels').replace('.jpg', '.txt').replace('.png','.txt')
-    maskpath = imgpath.replace('JPEGImages', 'mask').replace('/00', '/').replace('.jpg', '.png')
+    maskpath = imgpath.replace('images', 'mask').replace('JPEGImages', 'mask').replace('/00', '/').replace('.jpg', '.png')
 
     ## data augmentation
     img = Image.open(imgpath).convert('RGB')
     mask = Image.open(maskpath).convert('RGB')
     bg = Image.open(bgpath).convert('RGB')
-    
+
     img = change_background(img, mask, bg)
     img,flip,dx,dy,sx,sy = data_augmentation(img, shape, jitter, hue, saturation, exposure)
     ow, oh = img.size
